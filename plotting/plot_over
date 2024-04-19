@@ -237,26 +237,34 @@ find_disks() {
 
 
 # Identify replotted disks
+
 get_replotted_disks() {
     replotted_disks_array=()  # Array to store the names of replotted disks
     disks_replotted=0  # Counter for the number of replotted disks
 
+    echo "Checking which disks are fully replotted..."
+
     for disk in "${disks[@]}"; do
         contains_unwanted_plots=false
         for level in "${replot_levels_arr[@]}"; do
-            # Check if disk contains plots of this compression level
-            plot_pattern="plot-k32-c${level}-*.plot"
-            if find "$disk" -maxdepth "$search_depth" -type f -name "$plot_pattern" -exec false {} +; then
+            # Corrected find command to properly check for unwanted plots
+            if find "$disk" -maxdepth "$search_depth" -type f -name "plot-k32-c${level}-*.plot" -print -quit; then
+                echo "$disk contains unwanted plots at level $level."
                 contains_unwanted_plots=true
                 break
             fi
         done
 
         if [ "$contains_unwanted_plots" = false ]; then
+            echo "$disk is fully replotted."
             replotted_disks_array+=("$disk")  # Add disk to replotted_disks_array
             ((disks_replotted++))  # Increment the counter
+        else
+            echo "$disk is not fully replotted."
         fi
     done
+
+    echo "Total replotted disks: $disks_replotted out of ${#disks[@]}"
 }
 
 
@@ -298,37 +306,51 @@ get_free_disks() {
 }
 
 
-find_oldest_plot() {
-  local level=$1
-  oldest_plot=""
-  oldest_timestamp=$(date +%s)
-  file_count=0
+cache_plot_files() {
+    declare -gA plot_cache
+    echo "Building cache of plot files..."
 
-  # Iterate over eligible_disks and find the oldest plot file
-  for disk in "${eligible_disks[@]}"; do
-    if [[ "$level" -ge 1 && "$level" -le 9 ]]; then
-      single_digit=$(($level))
-      double_digit=$(printf "%02d" $level)
-      find_output=$(find "$disk" -maxdepth "$search_depth" -type f \( -name "plot-k32-c${single_digit}-*.plot" -o -name "plot-k32-c${double_digit}-*.plot" \) -printf '%T@ %p\n' 2>/dev/null)
-    else
-      find_output=$(find "$disk" -maxdepth "$search_depth" -type f -name "${plot_patterns[$level]}" -printf '%T@ %p\n' 2>/dev/null)
-    fi
+    total_files=0
+    for disk in "${disks[@]}"; do
+        for level in "${replot_levels_arr[@]}"; do
+            total_files=$((total_files + $(find "$disk" -maxdepth "$search_depth" -type f -name "plot-k32-c${level}-*.plot" | wc -l)))
+        done
+    done
 
-    if [ -n "$find_output" ]; then
-      while IFS= read -r line; do
-        timestamp=$(echo "$line" | awk '{print $1}')
-        file=$(echo "$line" | awk '{print $2}')
+    processed_files=0
 
-        if [ "$(echo "$timestamp < $oldest_timestamp" | bc)" -eq 1 ]; then
-          oldest_timestamp=$timestamp
-          oldest_plot=$file
-        fi
-        file_count=$((file_count + 1))
-      done <<< "$find_output"
-    fi
-  done
+    for disk in "${disks[@]}"; do
+        for level in "${replot_levels_arr[@]}"; do
+            while IFS= read -r -d '' file_path; do
+                mod_time=$(stat -c %Y "$file_path")
+                plot_cache["$file_path"]="$disk:$mod_time"
+                ((processed_files++))
+                echo -ne "Processing file $processed_files / $total_files\r"
+            done < <(find "$disk" -maxdepth "$search_depth" -type f -name "plot-k32-c${level}-*.plot" -print0)
+        done
+    done
+
+    echo -e "\nCache built with ${#plot_cache[@]} items."
 }
 
+
+find_oldest_plot() {
+    oldest_plot=""
+    oldest_time=$(date +%s)
+
+    for file in "${!plot_cache[@]}"; do
+        # Extract modification time and disk from the cache entry
+        IFS=':' read -r file_disk file_time <<< "${plot_cache[$file]}"
+
+        # Only consider files on eligible disks
+        if [[ " ${eligible_disks[@]} " =~ " ${file_disk} " ]]; then
+            if [[ "$file_time" -lt "$oldest_time" ]]; then
+                oldest_time="$file_time"
+                oldest_plot="$file"
+            fi
+        fi
+    done
+}
 
 
 # Remove identified plot and log action into logfile
@@ -345,7 +367,7 @@ remove_oldest_plot() {
         if [ "$dry_run" = true ]; then
             echo -e "${date_prefix}DRY-RUN would remove $oldest_plot"
         else
-            echo -e "${date_prefix}removing $oldest_plot"
+            echo -e "${date_prefix}Removing $oldest_plot"
             rm_output=$(rm -v "$oldest_plot" 2>&1)
             echo -e "${date_prefix}$rm_output"
         fi
@@ -356,12 +378,10 @@ remove_oldest_plot() {
         fi
 
         echo
+        unset plot_cache["$oldest_plot"]  # Remove the plot from the cache after processing
         plot_removed=true
     fi
 }
-
-
-
 
 # Find and remove the oldest plot file based on the provided compression level or skip in certain conditions
 process_plot_files() {
@@ -383,7 +403,7 @@ process_plot_files() {
 
       for level in "${replot_levels_arr[@]}"; do
         if [ "$plot_removed" = false ]; then
-          find_oldest_plot "$level"
+          find_oldest_plot
           remove_oldest_plot
           if [ "$plot_removed" = true ]; then
             sleep 2
@@ -396,7 +416,7 @@ process_plot_files() {
       get_free_disks
 
       # If no files with matching plot patterns were found
-      if [ $file_count -eq 0 ]; then
+      if [ ${#plot_cache[@]} -eq 0 ]; then
         echo -e "${date_prefix}No plot files with matching patterns were found."
         no_matching_plots_found=true
       fi
@@ -436,7 +456,7 @@ display_free_disks_info() {
   get_free_disks
   if [ ${#free_disks[@]} -gt 0 ]; then
     echo -e "${CYAN}${#free_disks[@]}${RESET} drives meet the requirements"
-    
+
     # Execute duf command only if not running as systemd service and duf is installed
     if [ "$running_as_systemd_service" -ne 0 ] && check_duf_installed; then
       duf ${free_disks[@]}
@@ -448,9 +468,9 @@ display_free_disks_info() {
 }
 
 
-
 validate_arguments
 find_disks
+cache_plot_files
 
 # Count total disks
 disk_count="${#disks[@]}"
@@ -466,20 +486,21 @@ fi
 
 # Main loop
 while true; do
-  if [ "$running_as_systemd_service" -ne 0 ]; then
-    clear
-    echo -e ${BOLD}Chiagarden plot_over${RESET}
-    echo
+    #clear
     display_config_info
     display_free_disks_info
     process_plot_files
-    sleep_interval
-  else
-    echo
-    display_config_info
-    display_free_disks_info
-    process_plot_files
-    sleep_interval_simple
-  fi
-done
+    # Only search for oldest plot if necessary
+    if [ "$enough_free_disks" = false ]; then
+        find_oldest_plot
+    else
+        echo -e "${CYAN}Sufficient free disks available. No removal needed.${RESET}"
+    fi
 
+    # Adjust sleep based on running context
+    if [ "$running_as_systemd_service" -ne 0 ]; then
+        sleep_interval
+    else
+        sleep_interval_simple
+    fi
+done
